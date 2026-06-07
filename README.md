@@ -10,6 +10,7 @@
   - `start()`：使用库自带的运行时引擎。
   - `start_with_tokio_rt(handle)`：复用开发者自己的 Tokio 运行时（该运行时由调用方保活，`shutdown` 不会关闭它）。
 - 注册多个监听回调，回调在引擎回调线程池上触发，不阻塞监听任务。
+- 查询 IP 栈能力（`ip_stack()` → `None` / `V4Only` / `V6Only` / `DualStack`），跨平台语义一致（基于 `have_v4` / `have_v6`）。
 - Windows 下基于 `INetworkListManager` 判定 Internet 可达性。
 
 ## 用法
@@ -31,6 +32,10 @@ async fn main() {
         .local_network_reachability()
         .expect("query reachability failed");
     println!("reachability: {reachability:?}");
+
+    // 查询当前 IP 栈能力（None / V4Only / V6Only / DualStack）。
+    let ip_stack = net.ip_stack().expect("query ip_stack failed");
+    println!("ip_stack: {ip_stack} (v4={}, v6={})", net.has_ipv4().unwrap(), net.has_ipv6().unwrap());
 
     // 注册网络状态变化监听（可注册多个）。未启动时返回 Ok(None)。
     let handle = net

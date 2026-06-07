@@ -7,6 +7,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::{self, MissedTickBehavior};
 use vibe_ready::{log_s, VibeEngine, VibeEngineConfig, VibeLogListener};
 
+use crate::ip_stack::IpStack;
 use crate::net::{NetworkStatusListener, NetworkStatusListenerHandle};
 use crate::net_error::NetError;
 use crate::network_status::NetworkStatus;
@@ -129,7 +130,11 @@ impl InnerNet {
                 let _ = monitor.stop_sender.send(());
             }
             // Silently reset the state; no callbacks are fired.
-            self.lock_state()?.reachability = NetworkStatus::Unavailable;
+            {
+                let mut guard = self.lock_state()?;
+                guard.reachability = NetworkStatus::Unavailable;
+                guard.ip_stack = IpStack::None;
+            }
             Ok(())
         })();
 
@@ -153,6 +158,12 @@ impl InnerNet {
         }
 
         Ok(self.lock_state()?.reachability)
+    }
+
+    /// Query the current IP-stack capability. Returns the cached value tracked
+    /// by the monitor task; [`NetError::Lock`] on poison.
+    pub fn ip_stack(&self) -> Result<IpStack, NetError> {
+        Ok(self.lock_state()?.ip_stack)
     }
 
     /// Register a network notification listener; multiple may be registered.
@@ -211,6 +222,13 @@ impl InnerNet {
         }
     }
 
+    /// Derive the IP-stack capability from the `netwatch` interface state. This
+    /// uses the same `have_v4` / `have_v6` flags on every platform, so the
+    /// reported value has consistent cross-platform semantics.
+    fn ip_stack_from_state(state: &netwatch::netmon::State) -> IpStack {
+        IpStack::from_flags(state.have_v4, state.have_v6)
+    }
+
     fn current_reachability(state: &netwatch::netmon::State) -> NetworkStatus {
         #[cfg(target_os = "windows")]
         if let Some(reachability) = Self::windows_network_reachability() {
@@ -257,6 +275,44 @@ impl InnerNet {
         Ok(())
     }
 
+    /// Update both reachability and IP-stack capability under a single lock.
+    ///
+    /// The IP-stack value is always refreshed (it has no listeners and fires no
+    /// callbacks). Reachability is only updated, and its listeners only
+    /// dispatched, when it actually changes — preserving the existing
+    /// change-detection contract. Used by the monitor task, which holds the full
+    /// `netwatch` state needed to compute both values at once.
+    ///
+    /// Returns [`NetError::Lock`] on poison, leaving handling to the caller;
+    /// never panics.
+    fn update_state_inner(
+        state: &Arc<Mutex<MonitorState>>,
+        dispatcher: &Dispatcher,
+        reachability: NetworkStatus,
+        ip_stack: IpStack,
+    ) -> Result<(), NetError> {
+        let listeners = {
+            let mut guard = state.lock().map_err(NetError::from_poison)?;
+            guard.ip_stack = ip_stack;
+            if guard.reachability == reachability {
+                return Ok(());
+            }
+            guard.reachability = reachability;
+            guard.listeners.values().cloned().collect::<Vec<_>>()
+        };
+
+        log_s!(
+            "network_status_listener",
+            "network_status",
+            reachability.name()
+        );
+
+        for listener in listeners {
+            dispatcher(listener, reachability);
+        }
+        Ok(())
+    }
+
     /// Monitor task body: ported from the reference project's
     /// `monitor_until_stopped`, but the state comes from the instance rather
     /// than a global.
@@ -279,9 +335,11 @@ impl InnerNet {
         };
         let mut interface_state = monitor.interface_state();
 
-        let current = Self::current_reachability(&interface_state.get());
+        let initial = interface_state.get();
+        let current = Self::current_reachability(&initial);
+        let ip_stack = Self::ip_stack_from_state(&initial);
         // If the initial state update fails (lock poisoned), end the task.
-        if Self::update_reachability_inner(&state, &dispatcher, current).is_err() {
+        if Self::update_state_inner(&state, &dispatcher, current, ip_stack).is_err() {
             let _ = initial_state.send(true);
             return;
         }
@@ -297,8 +355,9 @@ impl InnerNet {
                     match update {
                         Ok(new_state) => {
                             let reachability = Self::current_reachability(&new_state);
+                            let ip_stack = Self::ip_stack_from_state(&new_state);
                             // Exit the monitor loop if the lock is poisoned.
-                            if Self::update_reachability_inner(&state, &dispatcher, reachability).is_err() {
+                            if Self::update_state_inner(&state, &dispatcher, reachability, ip_stack).is_err() {
                                 break;
                             }
                         }
@@ -306,8 +365,10 @@ impl InnerNet {
                     }
                 }
                 _ = refresh_interval.tick() => {
-                    let reachability = Self::current_reachability(&interface_state.get());
-                    if Self::update_reachability_inner(&state, &dispatcher, reachability).is_err() {
+                    let snapshot = interface_state.get();
+                    let reachability = Self::current_reachability(&snapshot);
+                    let ip_stack = Self::ip_stack_from_state(&snapshot);
+                    if Self::update_state_inner(&state, &dispatcher, reachability, ip_stack).is_err() {
                         break;
                     }
                 }
@@ -318,6 +379,7 @@ impl InnerNet {
         // poisoned it cannot be reset, so just give up (without panicking).
         if let Ok(mut guard) = state.lock() {
             guard.reachability = NetworkStatus::Unavailable;
+            guard.ip_stack = IpStack::None;
         }
     }
 

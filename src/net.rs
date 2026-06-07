@@ -4,6 +4,7 @@ use tokio::runtime::Handle;
 use vibe_ready::VibeLogListener;
 
 use crate::inner::inner_net::InnerNet;
+use crate::ip_stack::IpStack;
 use crate::net_error::NetError;
 use crate::network_status::NetworkStatus;
 
@@ -124,6 +125,37 @@ impl Net {
             Some(inner) => inner.local_network_reachability(),
             None => Ok(NetworkStatus::default()),
         }
+    }
+
+    /// Query the IP-stack capability currently available to the host.
+    ///
+    /// Reflects which IP protocol versions have usable addresses / routes
+    /// (`have_v4` / `have_v6`), with identical semantics on every platform.
+    /// Returns [`IpStack::None`] when not started; returns [`NetError::Lock`] if
+    /// an internal lock is poisoned.
+    pub fn ip_stack(&self) -> Result<IpStack, NetError> {
+        match self.inner.read().map_err(NetError::from_poison)?.as_ref() {
+            Some(inner) => inner.ip_stack(),
+            None => Ok(IpStack::default()),
+        }
+    }
+
+    /// Query whether IPv4 is currently available.
+    ///
+    /// Convenience for [`Net::ip_stack`] followed by [`IpStack::has_ipv4`].
+    /// Returns `Ok(false)` when not started; returns [`NetError::Lock`] if an
+    /// internal lock is poisoned.
+    pub fn has_ipv4(&self) -> Result<bool, NetError> {
+        Ok(self.ip_stack()?.has_ipv4())
+    }
+
+    /// Query whether IPv6 is currently available.
+    ///
+    /// Convenience for [`Net::ip_stack`] followed by [`IpStack::has_ipv6`].
+    /// Returns `Ok(false)` when not started; returns [`NetError::Lock`] if an
+    /// internal lock is poisoned.
+    pub fn has_ipv6(&self) -> Result<bool, NetError> {
+        Ok(self.ip_stack()?.has_ipv6())
     }
 
     /// Register a network notification listener; multiple may be registered.
