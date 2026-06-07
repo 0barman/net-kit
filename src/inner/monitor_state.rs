@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::ip_stack::IpStack;
 use crate::net::NetworkStatusListenerHandle;
 use crate::network_status::NetworkStatus;
 
@@ -24,6 +25,8 @@ pub(crate) type Dispatcher = Arc<dyn Fn(SharedListener, NetworkStatus) + Send + 
 pub(crate) struct MonitorState {
     /// Current network reachability.
     pub(crate) reachability: NetworkStatus,
+    /// Current IP-stack capability (which IP protocol versions are available).
+    pub(crate) ip_stack: IpStack,
     /// Registered listener callbacks.
     pub(crate) listeners: HashMap<NetworkStatusListenerHandle, SharedListener>,
     /// Monotonic counter for allocating listener handles.
