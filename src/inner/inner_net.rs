@@ -447,10 +447,15 @@ impl InnerNet {
     /// Query the active Wi-Fi SSID via `netsh wlan show interfaces`.
     #[cfg(target_os = "windows")]
     fn query_wifi_network() -> Option<String> {
+        use std::os::windows::process::CommandExt;
         use std::process::Command;
+
+        /// Avoid spawning a visible console window for the `netsh` child process.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
         let output = Command::new("netsh")
             .args(["wlan", "show", "interfaces"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .ok()?;
 
