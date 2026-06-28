@@ -1,3 +1,4 @@
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,6 +19,17 @@ use super::monitor_state::{Dispatcher, MonitorState, SharedListener};
 pub(crate) struct InnerNet {
     engine: VibeEngine,
     state: Arc<Mutex<MonitorState>>,
+    /// Tokio runtime handle entered while a listener callback runs.
+    ///
+    /// Listener callbacks are dispatched on vibe-ready's callback thread pool,
+    /// whose workers are bare OS threads with **no ambient Tokio runtime**. A
+    /// listener that calls `tokio::spawn` (or any other runtime-dependent API)
+    /// would otherwise panic with *"there is no reactor running, must be called
+    /// from the context of a Tokio 1.x runtime"*. We capture a handle here and
+    /// enter it for the duration of every callback so such listeners resolve
+    /// against this runtime instead of crashing. `None` when no runtime could
+    /// be captured; the callback is still panic-guarded in that case.
+    runtime_handle: Option<Handle>,
 }
 
 impl InnerNet {
@@ -36,6 +48,10 @@ impl InnerNet {
         Ok(InnerNet {
             engine,
             state: Arc::new(Mutex::new(MonitorState::default())),
+            // `start` is async, so construction runs inside the caller's
+            // runtime; capture that handle so listener callbacks (which execute
+            // on vibe-ready's runtime-less callback threads) can still spawn.
+            runtime_handle: Handle::try_current().ok(),
         })
     }
 
@@ -44,12 +60,15 @@ impl InnerNet {
     /// destroys engine resources and does not close this runtime.
     pub fn new_with_tokio_rt(runtime_handle: Handle) -> Result<InnerNet, NetError> {
         let config = VibeEngineConfig::builder().app_name("net-kit").build();
-        let engine = VibeEngine::create_with_runtime_handle(config, runtime_handle)
+        let engine = VibeEngine::create_with_runtime_handle(config, runtime_handle.clone())
             .map_err(NetError::from)?;
 
         Ok(InnerNet {
             engine,
             state: Arc::new(Mutex::new(MonitorState::default())),
+            // The developer-supplied runtime is the one their listener
+            // callbacks expect to spawn onto; enter it during every callback.
+            runtime_handle: Some(runtime_handle),
         })
     }
 
@@ -102,9 +121,44 @@ impl InnerNet {
     /// engine callback thread pool.
     fn dispatcher(&self) -> Dispatcher {
         let callback = self.engine.executor().callback();
+        let runtime_handle = self.runtime_handle.clone();
         Arc::new(move |listener: SharedListener, status: NetworkStatus| {
-            callback.execute(move || listener(status));
+            let runtime_handle = runtime_handle.clone();
+            callback.execute(move || {
+                Self::invoke_listener(runtime_handle.as_ref(), &listener, status);
+            });
         })
+    }
+
+    /// Execute a single registered listener on the engine callback thread pool,
+    /// guaranteeing the call can never crash the process.
+    ///
+    /// The callback pool runs on bare OS worker threads (vibe-ready hands work
+    /// to a `threadpool` worker) that have **no ambient Tokio runtime**, so a
+    /// listener calling a runtime-dependent API such as `tokio::spawn` would
+    /// otherwise panic with *"there is no reactor running, must be called from
+    /// the context of a Tokio 1.x runtime"* and unwind straight through the
+    /// worker. Two independent layers of protection are applied:
+    ///
+    /// 1. When a runtime [`Handle`] is available it is entered for the duration
+    ///    of the call, so the listener's `tokio::spawn` / timers resolve against
+    ///    that runtime instead of panicking.
+    /// 2. The call is wrapped in [`catch_unwind`], so *any* panic raised by
+    ///    third-party listener code (for any reason, not only a missing runtime,
+    ///    and even if the entered runtime has since shut down) is contained and
+    ///    turned into a logged, non-fatal event.
+    fn invoke_listener(
+        runtime_handle: Option<&Handle>,
+        listener: &SharedListener,
+        status: NetworkStatus,
+    ) {
+        // Entering the handle installs it as this thread's current runtime for
+        // the lifetime of `_runtime_guard`; dropping the guard restores the
+        // previous (empty) context.
+        let _runtime_guard = runtime_handle.map(Handle::enter);
+        if catch_unwind(AssertUnwindSafe(|| listener(status))).is_err() {
+            log_s!("network_status_listener", "listener_panic", status.name());
+        }
     }
 
     pub async fn wait_for_initial_state(mut initial_state: watch::Receiver<bool>) {
@@ -537,9 +591,124 @@ impl InnerNet {
     }
 
     /// Install (or clear, with `None`) a listener that receives the engine's
-    /// internal log records. Forwarded straight to the engine; the callback runs
-    /// on the engine's logging path.
+    /// internal log records. The developer's callback runs on the engine's
+    /// logging path; we wrap it so a panic inside it can never unwind through
+    /// that path and abort the process.
     pub fn set_log_listener(&self, listener: Option<VibeLogListener>) {
-        self.engine.set_log_listener(listener)
+        self.engine
+            .set_log_listener(listener.map(Self::guard_log_listener))
+    }
+
+    /// Wrap a developer-supplied log listener so any panic it raises is caught
+    /// and discarded instead of propagating into vibe-ready's logging path.
+    fn guard_log_listener(listener: VibeLogListener) -> VibeLogListener {
+        Box::new(move |info| {
+            let _ = catch_unwind(AssertUnwindSafe(|| listener(info)));
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression coverage for the reported production crash:
+    //!
+    //! ```text
+    //! there is no reactor running, must be called from the context of a Tokio 1.x runtime
+    //! ```
+    //!
+    //! It happened because a registered listener called `tokio::spawn`, and
+    //! `net-kit` dispatched that listener on vibe-ready's callback thread pool —
+    //! bare OS workers with no ambient Tokio runtime. These tests exercise
+    //! [`InnerNet::invoke_listener`], the single choke point every listener call
+    //! now flows through, on a non-runtime thread (exactly like a callback
+    //! worker).
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    /// Build a single-threaded multi-thread runtime to hand to `invoke_listener`.
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+    }
+
+    /// Spin-wait (off any runtime) until `flag` is set or the deadline passes.
+    fn wait_for(flag: &AtomicBool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !flag.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        flag.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn listener_calling_tokio_spawn_runs_instead_of_panicking_with_handle() {
+        // The exact pattern that crashed: the listener calls `tokio::spawn`.
+        // With a runtime handle entered, it must spawn successfully — no panic.
+        let runtime = test_runtime();
+        let handle = runtime.handle().clone();
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_task = Arc::clone(&ran);
+        let listener: SharedListener = Arc::new(move |_status| {
+            let ran = Arc::clone(&ran_in_task);
+            tokio::spawn(async move {
+                ran.store(true, Ordering::SeqCst);
+            });
+        });
+
+        // Runs on the current (non-runtime) thread, just like a callback worker.
+        InnerNet::invoke_listener(Some(&handle), &listener, NetworkStatus::Available);
+
+        assert!(
+            wait_for(&ran),
+            "listener's tokio::spawn should have executed on the entered runtime"
+        );
+    }
+
+    #[test]
+    fn listener_calling_tokio_spawn_without_handle_is_contained() {
+        // No runtime handle available: the listener's `tokio::spawn` panics with
+        // the reported "there is no reactor running" message. `invoke_listener`
+        // must swallow it so the callback worker (and the process) survives.
+        let body_ran = Arc::new(AtomicBool::new(false));
+        let body_ran_in_listener = Arc::clone(&body_ran);
+        let listener: SharedListener = Arc::new(move |_status| {
+            body_ran_in_listener.store(true, Ordering::SeqCst);
+            // Panics: no ambient runtime on this thread.
+            tokio::spawn(async {});
+        });
+
+        // Must return normally despite the listener panicking internally.
+        InnerNet::invoke_listener(None, &listener, NetworkStatus::Available);
+
+        assert!(
+            body_ran.load(Ordering::SeqCst),
+            "listener body must have been entered before the contained panic"
+        );
+    }
+
+    #[test]
+    fn arbitrary_listener_panic_is_contained() {
+        // Any panic from third-party listener code — not just a missing runtime
+        // — must be contained rather than unwinding through the callback worker.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in_listener = Arc::clone(&calls);
+        let listener: SharedListener = Arc::new(move |_status| {
+            calls_in_listener.fetch_add(1, Ordering::SeqCst);
+            panic!("listener blew up");
+        });
+
+        InnerNet::invoke_listener(None, &listener, NetworkStatus::Available);
+        InnerNet::invoke_listener(None, &listener, NetworkStatus::Unavailable);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both panicking invocations must have run and been contained"
+        );
     }
 }
